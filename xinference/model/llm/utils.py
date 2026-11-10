@@ -341,7 +341,9 @@ class ChatModelMixin:
     @staticmethod
     @functools.lru_cache(maxsize=64)
     def _chat_template_needs_dict_arguments(chat_template: Optional[str]) -> bool:
-        # Detect templates that iterate tool-call arguments as a mapping.
+        # Detect templates that iterate tool-call arguments as a mapping, or
+        # serialize them with `tojson` without first checking for a string
+        # (which double-encodes OpenAI's JSON-string arguments).
         # Content-driven (not name-driven) so future models copying this
         # template style are covered automatically.
         if chat_template is None:
@@ -362,6 +364,15 @@ class ChatModelMixin:
             or (
                 "args_dict=tool_call.arguments" in compact
                 and "args_dict.items()" in compact
+            )
+            or (
+                re.search(r"(?:tool_call\.arguments|\['arguments'\])\|tojson", compact)
+                is not None
+                and re.search(
+                    r"arguments(?:'\])?\s+is\s+(?:not\s+)?(?:string|mapping)",
+                    chat_template,
+                )
+                is None
             )
         )
 
@@ -1766,16 +1777,20 @@ def generate_completion_chunk(
     total_tokens: int,
     has_choice: bool = True,
     has_content: bool = True,
+    stop_sequence: Optional[str] = None,
 ):
     choices = []
     if has_choice:
-        choices.append(
+        choice = (
             CompletionChoice(
                 text=chunk_text, index=0, logprobs=None, finish_reason=finish_reason
             )
             if has_content
             else CompletionChoice(index=0, logprobs=None, finish_reason=finish_reason)
         )
+        if stop_sequence is not None:
+            choice["stop_sequence"] = stop_sequence
+        choices.append(choice)
     return CompletionChunk(
         id=chunk_id,
         object="text_completion",

@@ -18,8 +18,10 @@ from urllib.parse import quote
 import requests
 
 from ..common import (
+    IMAGE_DOWNLOAD_TIMEOUT,
     convert_float_to_int_or_str,
     encode_world_reference,
+    is_http_url,
     normalize_endpoint,
     streaming_response_iterator,
 )
@@ -49,6 +51,20 @@ def _get_error_string(response: requests.Response) -> str:
     except requests.HTTPError as e:
         return str(e)
     return "Unknown error"
+
+
+def _streaming_response(response: requests.Response) -> Iterator[Any]:
+    def iterate():
+        try:
+            # Enter the cleanup scope before returning an unconsumed stream.
+            yield None
+            yield from streaming_response_iterator(response.iter_lines())
+        finally:
+            response.close()
+
+    stream = iterate()
+    next(stream)
+    return stream
 
 
 class RESTfulModelHandle:
@@ -349,6 +365,20 @@ class RESTfulImageModelHandle(RESTfulModelHandle):
         response_data = response.json()
         return response_data
 
+    def _download_if_url(self, image: Any) -> Any:
+        """Download an http(s) URL; paths, bytes and file objects pass through."""
+        if not (isinstance(image, str) and is_http_url(image)):
+            return image
+        # No auth headers: the Xinference credentials must not reach the image host.
+        try:
+            response = self.session.get(image, timeout=IMAGE_DOWNLOAD_TIMEOUT)
+            response.raise_for_status()
+            return response.content
+        except requests.RequestException as error:
+            raise RuntimeError(
+                f"Failed to download an image for editing, detail: {error}"
+            ) from error
+
     def image_edit(
         self,
         images: Union[Union[str, bytes], List[Union[str, bytes]]],
@@ -409,6 +439,12 @@ class RESTfulImageModelHandle(RESTfulModelHandle):
         )
         """
         url = f"{self._base_url}/v1/images/edits"
+        # The route takes uploaded files only, so URLs are downloaded here.
+        if isinstance(images, list):
+            images = [self._download_if_url(image) for image in images]
+        else:
+            images = self._download_if_url(images)
+        mask = self._download_if_url(mask)
         params = {
             "model": self._model_uid,
             "prompt": prompt,
@@ -818,7 +854,7 @@ class RESTfulGenerateModelHandle(RESTfulModelHandle):
             )
 
         if stream:
-            return streaming_response_iterator(response.iter_lines())
+            return _streaming_response(response)
 
         response_data = response.json()
         return response_data
@@ -899,7 +935,7 @@ class RESTfulChatModelHandle(RESTfulGenerateModelHandle):
             )
 
         if stream:
-            return streaming_response_iterator(response.iter_lines())
+            return _streaming_response(response)
 
         response_data = response.json()
         return response_data
@@ -1475,6 +1511,16 @@ class Client:
         if response.status_code != 202:
             raise RuntimeError(
                 f"Failed to reload model, detail: {_get_error_string(response)}"
+            )
+        return response.json()
+
+    def get_model_runtime_info(self, model_uid: str) -> Dict[str, Any]:
+        """Return runtime_context_length (tokens, or None) and per-replica limits."""
+        url = f"{self.base_url}/v1/models/{quote(model_uid, safe='')}/runtime"
+        response = self.session.get(url, headers=self._headers)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to get model runtime info, detail: {_get_error_string(response)}"
             )
         return response.json()
 

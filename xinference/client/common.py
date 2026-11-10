@@ -17,9 +17,17 @@ import json
 import os
 from typing import Any, AsyncIterator, Iterator, Union
 
+# (connect, read) seconds for fetching an image URL, as used by the server.
+# The read timeout limits inactivity, not the total download time.
+IMAGE_DOWNLOAD_TIMEOUT = (10, 30)
+
 
 def normalize_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
+
+
+def is_http_url(value: str) -> bool:
+    return value.lower().startswith(("http://", "https://"))
 
 
 def encode_world_reference(reference: Union[str, bytes], media_type: str) -> str:
@@ -85,6 +93,8 @@ def streaming_response_iterator(
 
 async def async_streaming_response_iterator(
     response_or_lines: Any,
+    *,
+    _prime: bool = False,
 ) -> AsyncIterator[Any]:
     """
     Create an AsyncIterator to handle the streaming type of generation.
@@ -114,6 +124,9 @@ async def async_streaming_response_iterator(
     )
     response_lines = response.content if response is not None else response_or_lines
     try:
+        if _prime:
+            # Enter the cleanup scope before handing the stream to the caller.
+            yield None
         async for line in response_lines:
             line = line.strip()
             if line.startswith(b"data:"):

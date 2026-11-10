@@ -15,6 +15,7 @@
 import asyncio
 import base64
 import gc
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -68,6 +69,7 @@ from starlette.responses import PlainTextResponse, StreamingResponse
 from uvicorn import Config, Server
 from xoscar.utils import get_next_port
 
+from .._compat import ValidationError
 from ..constants import (
     XINFERENCE_ALLOWED_IPS,
     XINFERENCE_AUTH_DB_PATH,
@@ -153,6 +155,7 @@ from .schemas import (
 )
 from .streaming_outcome import (
     FailureOrigin,
+    StreamState,
     get_stream_outcome_reporter,
     observe_stream,
     report_client_disconnect,
@@ -228,6 +231,16 @@ _TOKEN_ROUTER_REQUEST_HEADERS = {
 }
 
 
+def _parse_llm_request(schema, raw_body: dict):
+    # Resolve/validate the raw salt after authorization, allowing provider overrides.
+    try:
+        return schema.parse_obj(
+            {key: value for key, value in raw_body.items() if key != "cache_salt"}
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+
 class _SSERequestAbortController:
     """Abort and close an interrupted model stream exactly once."""
 
@@ -247,6 +260,7 @@ class _SSERequestAbortController:
         self._abort_task: Optional[asyncio.Task] = None
         self._body_iterator: Optional[AsyncIterator[Any]] = None
         self._stream_task: Optional[asyncio.Task] = None
+        self._completed = False
 
     def bind_body_iterator(self, body_iterator: AsyncIterator[Any]) -> None:
         self._body_iterator = body_iterator
@@ -254,7 +268,12 @@ class _SSERequestAbortController:
     def bind_stream_task(self) -> None:
         self._stream_task = asyncio.current_task()
 
+    def mark_completed(self) -> None:
+        self._completed = True
+
     async def abort(self) -> None:
+        if self._completed:
+            return
         if self._abort_task is None:
             operation = self._model.abort_request(self._request_id)
             if self._abort_timeout is not None:
@@ -273,13 +292,14 @@ class _SSERequestAbortController:
 
     async def handle_disconnect(self, _message: Dict[str, Any]) -> None:
         with anyio.CancelScope(shield=True):
-            report_client_disconnect(self._request)
-            logger.info(
-                "Disconnected from client (via refresh/close) %s during %s.",
-                self._request.client,
-                self._kind,
-            )
-            await self.abort()
+            if not self._completed:
+                report_client_disconnect(self._request)
+                logger.info(
+                    "Disconnected from client (via refresh/close) %s during %s.",
+                    self._request.client,
+                    self._kind,
+                )
+                await self.abort()
 
             # Cancel and join the response's stream task before the disconnect
             # listener returns. EventSourceResponse cancels its AnyIO task
@@ -547,6 +567,50 @@ async def _release_model_stream(model, iterator) -> None:
     await model.decrease_serve_count()
 
 
+async def _close_speech_stream(model, iterator) -> None:
+    """Keep speech admission until remote native abort acknowledgement."""
+
+    async def close():
+        try:
+            await _close_async_iterator(iterator)
+        finally:
+            await _release_model_stream(model, iterator)
+
+    cleanup = asyncio.create_task(close())
+    cancellation = None
+    with anyio.CancelScope(shield=True):
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+                if cleanup.cancelled():
+                    raise
+    if cancellation is not None:
+        raise cancellation
+
+
+def _guard_speech_stream_failure(request: Request, response: Response) -> Response:
+    """Do not let BaseHTTPMiddleware finalize failed PCM as a successful body."""
+    iterator = getattr(response, "body_iterator", None)
+    if request.url.path != "/v1/audio/speech" or iterator is None:
+        return response
+    if not response.headers.get("content-type", "").startswith(
+        "application/octet-stream"
+    ):
+        return response
+
+    async def body():
+        async for chunk in iterator:
+            yield chunk
+        if get_stream_outcome_reporter(request).outcome.state is StreamState.FAILED:
+            raise RuntimeError("Speech stream did not complete")
+
+    setattr(response, "body_iterator", body())
+    return response
+
+
 def _request_credential(request: Request) -> str:
     headers = {key.lower(): value for key, value in request.headers.items()}
     authorization = headers.get("authorization", "")
@@ -753,8 +817,6 @@ class RESTfulAPI(CancelMixin):
     # Add new class attributes
     _allowed_ip_list: Optional[List[ipaddress.IPv4Network]] = None
     _cluster_metrics_task: Optional[asyncio.Task[None]] = None
-    QWEN38_REASONING_EFFORTS = {"xhigh", "medium", "low"}
-    QWEN38_REASONING_MODEL_NAMES = {"qwen3.8", "qwen3.8-max", "qwen3.8-Flash-Next"}
 
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
@@ -1273,8 +1335,13 @@ class RESTfulAPI(CancelMixin):
             CONTEXT_LENGTH_EXCEEDED_DETAIL,
             ContextLengthExceeded,
         )
+        from ..request_priority import PRIORITY_ERROR_MESSAGES
 
         message = str(e)
+        if isinstance(e, ValueError):
+            for detail in PRIORITY_ERROR_MESSAGES:
+                if message.endswith(detail):
+                    raise HTTPException(status_code=400, detail=detail)
         context_error = isinstance(e, ContextLengthExceeded)
         if sanitize and RESTfulAPI._is_context_length_error(e):
             context_error = True
@@ -1573,6 +1640,7 @@ class RESTfulAPI(CancelMixin):
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=["X-Xinference-Error-Code", "Retry-After"],
         )
 
         async def ip_restriction_middleware(request: Request, call_next):
@@ -1589,7 +1657,8 @@ class RESTfulAPI(CancelMixin):
             async def check_ip(inner_request):
                 return await ip_restriction_middleware(inner_request, call_next)
 
-            return await self._audit_middleware(request, check_ip)
+            response = await self._audit_middleware(request, check_ip)
+            return _guard_speech_stream_failure(request, response)
 
         # Initialise OpenTelemetry tracing & metrics (no-op when disabled)
         if XINFERENCE_ENABLE_OTEL:
@@ -1919,6 +1988,16 @@ class RESTfulAPI(CancelMixin):
             logger.error(e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def get_model_runtime_info(self, model_uid: str) -> JSONResponse:
+        """Xinference metadata; compatibility model and generation schemas stay unchanged."""
+        try:
+            data = await (await self._get_supervisor_ref()).get_model_runtime_info(
+                model_uid
+            )
+            return JSONResponse(content=data)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
     async def describe_model(self, model_uid: str) -> JSONResponse:
         try:
             data = await (await self._get_supervisor_ref()).describe_running_model(
@@ -1938,6 +2017,42 @@ class RESTfulAPI(CancelMixin):
         except Exception as e:
             logger.error(e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+    @staticmethod
+    def _cache_session_tag(request: Request, value: Any, *, control: bool = False):
+        from ..model.llm.xavier.cache_lifecycle import (
+            CacheSessionTag,
+            validate_cache_session,
+        )
+
+        try:
+            data = validate_cache_session(value, control=control)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        credential = _request_credential(request)
+        data["id"] = hashlib.sha256(
+            json.dumps([credential, data["id"]]).encode()
+        ).hexdigest()
+        data["scope"] = hashlib.sha256(credential.encode()).hexdigest()
+        return CacheSessionTag(**data)
+
+    async def update_cache_session(
+        self, model_uid: str, request: Request
+    ) -> JSONResponse:
+        self._check_model_access(request, model_uid, "LLM")
+        session = self._cache_session_tag(request, await request.json(), control=True)
+        supervisor = await self._get_supervisor_ref()
+        try:
+            accepted = await asyncio.wait_for(
+                supervisor.update_cache_session(model_uid, session.to_dict()), timeout=1
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                503, "Cache lifecycle hints are temporarily unavailable"
+            ) from None
+        return JSONResponse({"accepted": accepted})
 
     async def launch_model(
         self, request: Request, wait_ready: bool = Query(True)
@@ -1961,6 +2076,8 @@ class RESTfulAPI(CancelMixin):
         enable_virtual_env = payload.get("enable_virtual_env", None)
         virtual_env_packages = payload.get("virtual_env_packages", None)
         virtual_env_find_links = payload.get("virtual_env_find_links", None)
+        virtual_env_index_url = payload.get("virtual_env_index_url", None)
+        virtual_env_extra_index_urls = payload.get("virtual_env_extra_index_urls", None)
         envs = payload.get("envs", None)
         replica_config = _parse_replica_config(payload)
 
@@ -1984,6 +2101,8 @@ class RESTfulAPI(CancelMixin):
             "virtual_env_packages",
             "model_python_executable",
             "virtual_env_find_links",
+            "virtual_env_index_url",
+            "virtual_env_extra_index_urls",
             "envs",
             "replica_config",
         }
@@ -2038,6 +2157,8 @@ class RESTfulAPI(CancelMixin):
                 enable_virtual_env=enable_virtual_env,
                 virtual_env_packages=virtual_env_packages,
                 virtual_env_find_links=virtual_env_find_links,
+                virtual_env_index_url=virtual_env_index_url,
+                virtual_env_extra_index_urls=virtual_env_extra_index_urls,
                 envs=envs,
                 replica_config=replica_config,
                 **kwargs,
@@ -2603,10 +2724,7 @@ class RESTfulAPI(CancelMixin):
 
     async def create_completion(self, request: Request) -> Response:
         raw_body = await request.json()
-        # Resolve/validate the raw salt after authorization, allowing provider overrides.
-        body = CreateCompletionRequest.parse_obj(
-            {key: value for key, value in raw_body.items() if key != "cache_salt"}
-        )
+        body = _parse_llm_request(CreateCompletionRequest, raw_body)
         exclude = {
             "prompt",
             "model",
@@ -2649,13 +2767,13 @@ class RESTfulAPI(CancelMixin):
             is_vllm_backend,
             stream=bool(body.stream),
         )
-        model_call_kwargs: Dict[str, Any] = {"raw_params": raw_kwargs}
+        model_call_kwargs: Dict[str, Any] = {
+            "raw_params": raw_kwargs,
+            "request_id": request_id,
+        }
         if is_vllm_backend:
             kwargs.pop("request_id", None)
             raw_kwargs.pop("request_id", None)
-            model_call_kwargs["request_id"] = request_id
-        elif await model.is_transformers_batching_enabled():
-            model_call_kwargs["request_id"] = request_id
 
         if body.stream:
             abort_controller = _SSERequestAbortController(
@@ -2684,6 +2802,7 @@ class RESTfulAPI(CancelMixin):
                     async for item in observed_iterator:
                         yield item
                     completed = True
+                    abort_controller.mark_completed()
                 except asyncio.CancelledError as exc:
                     report_client_disconnect(request, exc)
                     logger.info(
@@ -3976,6 +4095,15 @@ class RESTfulAPI(CancelMixin):
                 **parsed_kwargs,
             )
             if body.stream:
+                cleanup_task: Optional[asyncio.Task[None]] = None
+
+                async def release_speech():
+                    nonlocal cleanup_task
+                    if cleanup_task is None:
+                        cleanup_task = asyncio.create_task(
+                            _close_speech_stream(model, out)
+                        )
+                    await asyncio.shield(cleanup_task)
 
                 async def stream_results():
                     try:
@@ -3986,13 +4114,20 @@ class RESTfulAPI(CancelMixin):
                         ):
                             yield item
                     finally:
-                        await _release_model_stream(model, out)
+                        await release_speech()
 
-                return EventSourceResponse(
+                response = EventSourceResponse(
                     media_type="application/octet-stream",
                     content=stream_results(),
                     ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
                 )
+
+                async def disconnected(message):
+                    report_client_disconnect(request)
+                    await release_speech()
+
+                _observe_sse_disconnect(response, disconnected)
+                return response
             else:
                 return Response(
                     media_type=_audio_response_media_type(body.response_format),
@@ -4987,72 +5122,11 @@ class RESTfulAPI(CancelMixin):
             return dict(value)
         return {}
 
-    @classmethod
-    def _is_qwen38_description(cls, desc: dict) -> bool:
-        return (
-            desc.get("model_name") in cls.QWEN38_REASONING_MODEL_NAMES
-            or desc.get("model_family") in cls.QWEN38_REASONING_MODEL_NAMES
-        )
-
-    @classmethod
-    def _apply_qwen38_reasoning_effort(
-        cls, raw_body: dict, raw_kwargs: dict, kwargs: dict
-    ) -> None:
-        has_top_level_effort = "reasoning_effort" in raw_body
-        top_level_effort = raw_body.get("reasoning_effort")
-        chat_template_kwargs = cls._coerce_chat_template_kwargs(
-            raw_kwargs.get("chat_template_kwargs")
-        )
-        has_template_effort = "reasoning_effort" in chat_template_kwargs
-        template_effort = chat_template_kwargs.get("reasoning_effort")
-
-        if not has_top_level_effort and not has_template_effort:
-            return
-
-        if has_template_effort and template_effort not in cls.QWEN38_REASONING_EFFORTS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Invalid chat_template_kwargs.reasoning_effort for qwen3.8. "
-                    "Supported values are xhigh, medium, and low."
-                ),
-            )
-
-        if not has_top_level_effort:
-            return
-
-        if top_level_effort not in cls.QWEN38_REASONING_EFFORTS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Invalid reasoning_effort for qwen3.8. Supported values are "
-                    "xhigh, medium, and low. Use chat_template_kwargs.enable_thinking "
-                    "to disable thinking."
-                ),
-            )
-
-        if has_template_effort and template_effort != top_level_effort:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Conflicting reasoning_effort values for qwen3.8. Provide either "
-                    "top-level reasoning_effort or matching "
-                    "chat_template_kwargs.reasoning_effort."
-                ),
-            )
-
-        chat_template_kwargs["reasoning_effort"] = top_level_effort
-        raw_kwargs.pop("reasoning_effort", None)
-        kwargs.pop("reasoning_effort", None)
-        raw_kwargs["chat_template_kwargs"] = chat_template_kwargs
-        kwargs["chat_template_kwargs"] = chat_template_kwargs
-
     async def create_chat_completion(self, request: Request) -> Response:
         raw_body = await request.json()
-        # Resolve/validate the raw salt after authorization, allowing provider overrides.
-        body = CreateChatCompletion.parse_obj(
-            {key: value for key, value in raw_body.items() if key != "cache_salt"}
-        )
+        routing_key = raw_body.pop("routing_key", None)
+        cache_session = raw_body.pop("cache_session", None)
+        body = _parse_llm_request(CreateChatCompletion, raw_body)
         raw_body = _normalize_token_router_chat_payload(raw_body)
         exclude = {
             "prompt",
@@ -5116,6 +5190,19 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model_type("llm")
         self._check_model_access(request, model_uid, "LLM")
         self._apply_cache_salt(request, raw_body, kwargs, raw_kwargs)
+        routing_options = {}
+        if routing_key is not None:
+            if (
+                not isinstance(routing_key, str)
+                or len(routing_key) > 128
+                or not routing_key.strip()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="routing_key must be a non-blank string of at most 128 characters",
+                )
+            scope = json.dumps([_request_credential(request), routing_key])
+            routing_options["routing_key"] = hashlib.sha256(scope.encode()).hexdigest()
 
         supervisor_ref = await self._get_supervisor_ref()
         token_router_runtime = None
@@ -5138,24 +5225,68 @@ class RESTfulAPI(CancelMixin):
                     status_code=503,
                     headers={"Retry-After": "1"},
                 )
+            from ..router.tokenizer import (
+                TokenizationError,
+                normalize_chat_template_kwargs,
+            )
+
+            try:
+                template_kwargs = normalize_chat_template_kwargs(raw_body)
+            except TokenizationError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            if template_kwargs:
+                raw_body["chat_template_kwargs"] = template_kwargs
             return await self._proxy_token_router_chat_completion(
                 request, raw_body, token_router_runtime
             )
 
+        from ..model.llm.xavier.cache_lifecycle import CACHE_SESSION_ARG
+
+        for config in (kwargs, raw_kwargs):
+            config.pop(CACHE_SESSION_ARG, None)
         model = await require_model(
-            self._get_supervisor_ref, model_uid, self._report_error_event
+            self._get_supervisor_ref,
+            model_uid,
+            self._report_error_event,
+            **routing_options,
         )
         is_vllm_backend = await model.is_vllm_backend()
-        model_call_kwargs: Dict[str, Any] = {"raw_params": raw_kwargs}
+        if cache_session is not None:
+            tag = self._cache_session_tag(request, cache_session)
+            try:
+                await asyncio.wait_for(
+                    supervisor_ref.update_cache_session(model_uid, tag.to_dict()),
+                    timeout=1,
+                )
+            except Exception:
+                logger.debug(
+                    "Agent cache hint unavailable; continuing chat", exc_info=True
+                )
+            else:
+                for config in (kwargs, raw_kwargs):
+                    config[CACHE_SESSION_ARG] = tag
+        model_call_kwargs: Dict[str, Any] = {
+            "raw_params": raw_kwargs,
+            "request_id": request_id,
+        }
         if is_vllm_backend:
             kwargs.pop("request_id", None)
             raw_kwargs.pop("request_id", None)
-            model_call_kwargs["request_id"] = request_id
-        elif await model.is_transformers_batching_enabled():
-            model_call_kwargs["request_id"] = request_id
 
         try:
-            desc = await (await self._get_supervisor_ref()).describe_model(model_uid)
+            description_options = (
+                {"selected_replica_uid": model.uid.decode()} if routing_options else {}
+            )
+            try:
+                desc = await supervisor_ref.describe_model(
+                    model_uid, **description_options
+                )
+            except ModelNotReadyError:
+                if not description_options:
+                    raise
+                # Scaling may remove the selected replica after lookup. Model
+                # metadata is still available from another live replica.
+                desc = await supervisor_ref.describe_model(model_uid)
         except ModelNotReadyError as e:
             raise HTTPException(
                 status_code=503,
@@ -5171,6 +5302,11 @@ class RESTfulAPI(CancelMixin):
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
+        from ..model.llm.reasoning_controls import (
+            ReasoningEffortConfig,
+            has_reasoning_controls,
+            normalize_reasoning_controls,
+        )
         from ..model.llm.utils import (
             DEEPSEEK_TOOL_CALL_FAMILY,
             GEMMA_TOOL_CALL_FAMILY,
@@ -5182,8 +5318,29 @@ class RESTfulAPI(CancelMixin):
             QWEN_TOOL_CALL_FAMILY,
         )
 
-        if self._is_qwen38_description(desc):
-            self._apply_qwen38_reasoning_effort(raw_body, raw_kwargs, kwargs)
+        try:
+            controls_requested = has_reasoning_controls(raw_kwargs)
+            if controls_requested:
+                capability = desc.get("reasoning_effort")
+                control_config = dict(kwargs)
+                for key in (
+                    "reasoning_effort",
+                    "thinking_budget",
+                    "chat_template_kwargs",
+                ):
+                    if key in raw_kwargs:
+                        control_config[key] = raw_kwargs[key]
+                kwargs = normalize_reasoning_controls(
+                    control_config,
+                    ReasoningEffortConfig.parse_obj(capability) if capability else None,
+                )
+                raw_kwargs.pop("reasoning_effort", None)
+                raw_kwargs.pop("thinking_budget", None)
+                raw_kwargs["chat_template_kwargs"] = kwargs["chat_template_kwargs"]
+        except NotImplementedError as exc:
+            raise HTTPException(501, str(exc))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc))
 
         model_family = desc.get("model_family", "")
         RESTfulAPI._apply_multiple_choice_count(
@@ -5324,6 +5481,43 @@ class RESTfulAPI(CancelMixin):
                     media_counts,
                 )
 
+        if (
+            controls_requested
+            and (kwargs.get("chat_template_kwargs") or {}).get("thinking_budget")
+            is not None
+        ):
+            try:
+                prepared = await model.prepare_reasoning_request(kwargs)
+                if isinstance(prepared, (str, bytes)):
+                    prepared = json.loads(prepared)
+                if not isinstance(prepared, dict):
+                    raise ValueError("Invalid reasoning preflight response")
+                if "error" in prepared:
+                    error = prepared["error"]
+                    if (
+                        not isinstance(error, dict)
+                        or error.get("status") not in {400, 501}
+                        or not isinstance(error.get("message"), str)
+                    ):
+                        raise ValueError("Invalid reasoning preflight error")
+                    raise HTTPException(error["status"], error["message"])
+            except HTTPException:
+                raise
+            except ModelNotReadyError as exc:
+                raise HTTPException(
+                    503,
+                    "Model is loading, please retry later",
+                    headers={"Retry-After": "30"},
+                ) from exc
+            except Exception as exc:
+                self.handle_request_limit_error(exc, sanitize=True)
+                logger.exception("Reasoning request preflight failed")
+                raise HTTPException(
+                    503, "Reasoning request preflight is temporarily unavailable"
+                ) from exc
+            kwargs = prepared
+            raw_kwargs["chat_template_kwargs"] = kwargs["chat_template_kwargs"]
+
         if "skip_special_tokens" in raw_kwargs and is_vllm_backend:
             kwargs["skip_special_tokens"] = raw_kwargs["skip_special_tokens"]
         if body.stream:
@@ -5350,6 +5544,7 @@ class RESTfulAPI(CancelMixin):
                     async for item in observed_iterator:
                         yield item
                     completed = True
+                    abort_controller.mark_completed()
                     yield "[DONE]"
                 # Note that asyncio.CancelledError does not inherit from Exception.
                 # When the user uses ctrl+c to cancel the streaming chat, asyncio.CancelledError would be triggered.
